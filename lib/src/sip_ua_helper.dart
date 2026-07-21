@@ -599,6 +599,22 @@ class Call {
     refer.on(EventReferFailed(), (EventReferFailed data) {});
   }
 
+  /// Sends a REFER with a [replaces] dialog identifier (RFC 3891 §3).
+  ///
+  /// Unlike [refer], this does **not** auto-terminate the session when the
+  /// REFER is accepted. For attended transfer (RFC 5589), the server needs
+  /// the session to stay alive while it bridges the two far-end parties.
+  /// The server will send BYE once the transfer completes.
+  ///
+  /// [replaces] must contain `call_id`, `to_tag`, and `from_tag` of the
+  /// dialog to be replaced.
+  void referWithReplaces(String target, Map<String, dynamic> replaces) {
+    assert(_session != null, 'ERROR(referWithReplaces): rtc session is invalid!');
+    _session.refer(target, <String, dynamic>{
+      'replaces': replaces,
+    });
+  }
+
   void hangup([Map<String, dynamic>? options]) {
     assert(_session != null, 'ERROR(hangup): rtc session is invalid!');
     if (peerConnection != null) {
