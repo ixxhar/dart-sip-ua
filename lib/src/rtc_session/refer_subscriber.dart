@@ -31,9 +31,12 @@ class ReferSubscriber extends EventManager {
     String replaces = '';
 
     if (options['replaces'] != null) {
-      replaces = options['replaces'].call_id;
-      replaces += ';to-tag=${options['replaces'].to_tag}';
-      replaces += ';from-tag=${options['replaces'].from_tag}';
+      // Accept both a typed object (with .call_id etc.) and a plain Map.
+      final r = options['replaces'];
+      final cid = (r is Map) ? r['call_id'] ?? '' : r.call_id ?? '';
+      final tt  = (r is Map) ? r['to_tag']  ?? '' : r.to_tag  ?? '';
+      final ft  = (r is Map) ? r['from_tag'] ?? '' : r.from_tag ?? '';
+      replaces = '$cid${tt.isNotEmpty ? ';to-tag=$tt' : ''}${ft.isNotEmpty ? ';from-tag=$ft' : ''}';
       replaces = Uri.encodeComponent(replaces);
     }
 
