@@ -152,7 +152,12 @@ class Checks {
     'contact_uri': (Settings src, Settings? dst) {
       dynamic contact_uri = src.contact_uri;
       if (contact_uri == null) return;
-      if (contact_uri is String) {
+      // sip_ua_helper normalizes UaSettings.contact_uri into a URI instance
+      // before load(); the previous String-only branch silently dropped it,
+      // which forced a random Contact user on REGISTER.
+      if (contact_uri is URI) {
+        dst!.contact_uri = contact_uri;
+      } else if (contact_uri is String) {
         dynamic uri = Grammar.parse(contact_uri, 'SIP_URI');
         if (uri != -1) {
           dst!.contact_uri = uri;

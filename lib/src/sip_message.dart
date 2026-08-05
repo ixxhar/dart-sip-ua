@@ -532,6 +532,18 @@ class IncomingRequest extends IncomingMessage {
   * -param {Function} [onSuccess] onSuccess callback
   * -param {Function} [onFailure] onFailure callback
   */
+  /// Stateful reply when a server transaction exists; otherwise stateless.
+  void replySafe(int code, [String? reason]) {
+    if (server_transaction != null) {
+      reply(code, reason);
+    } else if (transport != null) {
+      logger.d('replySafe($code): no server transaction, using reply_sl');
+      reply_sl(code, reason);
+    } else {
+      logger.w('replySafe($code): no server transaction or transport');
+    }
+  }
+
   void reply(int code,
       [String? reason,
       List<dynamic>? extraHeaders,
@@ -541,13 +553,9 @@ class IncomingRequest extends IncomingMessage {
     List<dynamic> supported = <dynamic>[];
     dynamic to = getHeader('To');
 
-    reason = reason ?? null;
-
     // Validate code and reason values.
     if (code < 100 || code > 699) {
       throw Exceptions.TypeError('Invalid status_code: $code');
-    } else if (reason != null) {
-      throw Exceptions.TypeError('Invalid reason_phrase: $reason');
     }
 
     reason = reason ?? DartSIP_C.REASON_PHRASE[code] ?? '';
@@ -640,6 +648,14 @@ class IncomingRequest extends IncomingMessage {
 
     IncomingMessage message = IncomingMessage();
     message.data = response;
+
+    if (server_transaction == null) {
+      logger.d('reply($code): no server transaction, falling back to reply_sl');
+      if (transport != null) {
+        transport!.send(response);
+      }
+      return;
+    }
 
     server_transaction!.receiveResponse(code, message,
         onSuccess as void Function()?, onFailure as void Function()?);
