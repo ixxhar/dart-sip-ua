@@ -43,6 +43,12 @@ class SIPUAHelper extends EventManager {
   RegistrationState _registerState =
       RegistrationState(state: RegistrationStateEnum.NONE);
 
+  /// Optional hook for incoming INVITEs, invoked synchronously from
+  /// [RTCSession.init_incoming] before 180 Ringing.  EXPERIMENTAL — prefer
+  /// handling DND via CallManager CALL_INITIATION (sync stream) instead.
+  @Deprecated('Use CallManager CALL_INITIATION (sync stream) for DND')
+  bool Function(RTCSession session)? incomingSessionInterceptor;
+
   /// Sets the logging level for the default logger. Has no effect if custom logger is supplied.
   set loggingLevel(Level loggingLevel) => Log.loggingLevel = loggingLevel;
 
@@ -244,6 +250,13 @@ class SIPUAHelper extends EventManager {
         logger.d('newRTCSession => $event');
         RTCSession session = event.session!;
         if (session.direction == Direction.incoming) {
+          // Pre-180 intercept (DND). Returning true means the session was
+          // terminated — skip listener notify so the UI never sees the INVITE.
+          final interceptor = incomingSessionInterceptor;
+          if (interceptor != null && interceptor(session)) {
+            logger.d('incomingSessionInterceptor rejected session');
+            return;
+          }
           // Set event handlers.
           session.addAllEventHandlers(
               buildCallOptions()['eventHandlers'] as EventManager);
@@ -619,7 +632,7 @@ class Call {
     assert(_session != null, 'ERROR(hangup): rtc session is invalid!');
     if (peerConnection != null) {
       for (MediaStream? stream in peerConnection!.getLocalStreams()) {
-        if (stream == null) return;
+        if (stream == null) continue;
         logger.d(
             'Stopping local stream with tracks: ${stream.getTracks().length}');
         for (MediaStreamTrack track in stream.getTracks()) {
@@ -628,7 +641,7 @@ class Call {
         }
       }
       for (MediaStream? stream in peerConnection!.getRemoteStreams()) {
-        if (stream == null) return;
+        if (stream == null) continue;
         logger.d(
             'Stopping remote stream with tracks: ${stream.getTracks().length}');
         for (MediaStreamTrack track in stream.getTracks()) {

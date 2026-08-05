@@ -446,8 +446,11 @@ class RTCSession extends EventManager implements Owner {
     // Fire 'newRTCSession' event.
     _newRTCSession(Originator.remote, request);
 
-    // The user may have rejected the call in the 'newRTCSession' event.
-    if (_state == RtcSessionState.terminated) {
+    // The user may have rejected the call in the 'newRTCSession' event
+    // (e.g. DND auto-reject with 486). Do not send 180 Ringing in that case.
+    if (_state == RtcSessionState.terminated ||
+        _state == RtcSessionState.canceled) {
+      logger.d('init_incoming() aborted — session already terminated/canceled');
       return;
     }
 
@@ -1085,11 +1088,9 @@ class RTCSession extends EventManager implements Owner {
       }
     });
     handlers.on(EventCallFailed(), (EventCallFailed event) {
-      terminate(<String, dynamic>{
-        'cause': DartSIP_C.CausesType.WEBRTC_ERROR,
-        'status_code': 500,
-        'reason_phrase': 'Hold Failed'
-      });
+      // Do not terminate the call — hold renegotiation can fail on desktop
+      // without the session being unusable. Keep the dialog alive.
+      logger.e('Hold renegotiation failed: ${event.cause}');
     });
 
     if (options['useUpdate'] != null) {
@@ -1137,11 +1138,9 @@ class RTCSession extends EventManager implements Owner {
       }
     });
     handlers.on(EventCallFailed(), (EventCallFailed event) {
-      terminate(<String, dynamic>{
-        'cause': DartSIP_C.CausesType.WEBRTC_ERROR,
-        'status_code': 500,
-        'reason_phrase': 'Unhold Failed'
-      });
+      // Do not terminate the call — unhold renegotiation can fail without
+      // requiring dialog teardown.
+      logger.e('Unhold renegotiation failed: ${event.cause}');
     });
 
     if (options['useUpdate'] != null) {
@@ -1294,6 +1293,33 @@ class RTCSession extends EventManager implements Owner {
     return _dialog!.sendRequest(method, options);
   }
 
+  bool _isSessionEnded() =>
+      _state == RtcSessionState.terminated || _state == RtcSessionState.canceled;
+
+  /// RFC 3261 §12.2 — dialog/session no longer exists.
+  void _replyCallTransactionDoesNotExist(IncomingRequest request) {
+    request.replySafe(481);
+  }
+
+  /// RFC 3261 §15 — request terminated (e.g. CANCELled INVITE transaction).
+  void _replyRequestTerminated(IncomingRequest request) {
+    request.replySafe(487);
+  }
+
+  /// In-dialog request received when the session is already ended.
+  void _replyEndedSessionRequest(IncomingRequest request) {
+    switch (request.method) {
+      case SipMethod.BYE:
+      case SipMethod.CANCEL:
+        // Idempotent ack for duplicate BYE/CANCEL after local teardown.
+        request.replySafe(200);
+        break;
+      default:
+        _replyCallTransactionDoesNotExist(request);
+        break;
+    }
+  }
+
   /**
    * In dialog Request Reception
    */
@@ -1308,6 +1334,11 @@ class RTCSession extends EventManager implements Owner {
       * established.
       */
 
+      if (_isSessionEnded()) {
+        request.replySafe(200);
+        return;
+      }
+
       /*
       * Terminate the whole session in case the user didn't accept (or yet send the answer)
       * nor reject the request opening the session.
@@ -1318,10 +1349,19 @@ class RTCSession extends EventManager implements Owner {
         _request.reply(487);
         _failed(Originator.remote, null, request, null, 487,
             DartSIP_C.CausesType.CANCELED, request.reason_phrase);
+      } else {
+        _replyCallTransactionDoesNotExist(request);
       }
-    } else {
-      // Requests arriving here are in-dialog requests.
-      switch (request.method) {
+      return;
+    }
+
+    if (_isSessionEnded()) {
+      _replyEndedSessionRequest(request);
+      return;
+    }
+
+    // Requests arriving here are in-dialog requests.
+    switch (request.method) {
         case SipMethod.ACK:
           if (_state != RtcSessionState.waitingForAck) {
             return;
@@ -1393,7 +1433,7 @@ class RTCSession extends EventManager implements Owner {
                     status_code: request.status_code,
                     reason_phrase: request.reason_phrase));
           } else {
-            request.reply(403, 'Wrong Status');
+            _replyCallTransactionDoesNotExist(request);
           }
           break;
         case SipMethod.INVITE:
@@ -1404,7 +1444,7 @@ class RTCSession extends EventManager implements Owner {
               _receiveReinvite(request);
             }
           } else {
-            request.reply(403, 'Wrong Status');
+            _replyCallTransactionDoesNotExist(request);
           }
           break;
         case SipMethod.INFO:
@@ -1424,33 +1464,32 @@ class RTCSession extends EventManager implements Owner {
               request.reply(415);
             }
           } else {
-            request.reply(403, 'Wrong Status');
+            _replyCallTransactionDoesNotExist(request);
           }
           break;
         case SipMethod.UPDATE:
           if (_state == RtcSessionState.confirmed) {
             _receiveUpdate(request);
           } else {
-            request.reply(403, 'Wrong Status');
+            _replyCallTransactionDoesNotExist(request);
           }
           break;
         case SipMethod.REFER:
           if (_state == RtcSessionState.confirmed) {
             _receiveRefer(request);
           } else {
-            request.reply(403, 'Wrong Status');
+            _replyCallTransactionDoesNotExist(request);
           }
           break;
         case SipMethod.NOTIFY:
           if (_state == RtcSessionState.confirmed) {
             _receiveNotify(request);
           } else {
-            request.reply(403, 'Wrong Status');
+            _replyCallTransactionDoesNotExist(request);
           }
           break;
         default:
           request.reply(501);
-      }
     }
   }
 
@@ -1944,6 +1983,12 @@ class RTCSession extends EventManager implements Owner {
   /// In dialog INVITE Reception
   void _receiveReinvite(IncomingRequest request) async {
     logger.d('receiveReinvite()');
+
+    if (_isSessionEnded()) {
+      _replyCallTransactionDoesNotExist(request);
+      return;
+    }
+
     String? contentType = request.getHeader('Content-Type');
 
     void sendAnswer(String? sdp) async {
@@ -2008,15 +2053,25 @@ class RTCSession extends EventManager implements Owner {
       return true;
     }
 
-    RTCSessionDescription? desc = await _processInDialogSdpOffer(request);
+    RTCSessionDescription? desc;
+    try {
+      desc = await _processInDialogSdpOffer(request);
+    } on Exceptions.InvalidStateError {
+      return;
+    }
+
+    if (desc == null) {
+      return;
+    }
+
+    final RTCSessionDescription offerDesc = desc;
 
     Future<bool> acceptReInvite(dynamic options) async {
       try {
-        // Send answer.
-        if (_state == RtcSessionState.terminated) {
+        if (_isSessionEnded()) {
           return false;
         }
-        sendAnswer(desc.sdp);
+        sendAnswer(offerDesc.sdp);
       } catch (error) {
         logger.e('Got anerror on re-INVITE: ${error.toString()}');
       }
@@ -2051,6 +2106,11 @@ class RTCSession extends EventManager implements Owner {
    */
   void _receiveUpdate(IncomingRequest request) async {
     logger.d('receiveUpdate()');
+
+    if (_isSessionEnded()) {
+      _replyCallTransactionDoesNotExist(request);
+      return;
+    }
 
     bool rejected = false;
 
@@ -2102,18 +2162,27 @@ class RTCSession extends EventManager implements Owner {
     }
 
     try {
-      RTCSessionDescription desc = await _processInDialogSdpOffer(request);
-      if (_state == RtcSessionState.terminated) return;
+      RTCSessionDescription? desc = await _processInDialogSdpOffer(request);
+      if (desc == null || _isSessionEnded()) {
+        return;
+      }
       // Send answer.
       sendAnswer(desc.sdp);
+    } on Exceptions.InvalidStateError {
+      return;
     } catch (error) {
       logger.e('Got error on UPDATE: ${error.toString()}');
     }
   }
 
-  Future<RTCSessionDescription> _processInDialogSdpOffer(
+  Future<RTCSessionDescription?> _processInDialogSdpOffer(
       IncomingRequest request) async {
     logger.d('_processInDialogSdpOffer()');
+
+    if (_isSessionEnded()) {
+      _replyCallTransactionDoesNotExist(request);
+      throw Exceptions.InvalidStateError('terminated');
+    }
 
     Map<String, dynamic>? sdp = request.parseSDP();
 
@@ -2194,13 +2263,18 @@ class RTCSession extends EventManager implements Owner {
     RTCSessionDescription offer =
         RTCSessionDescription(processedSDP, SdpType.offer.name);
 
-    if (_state == RtcSessionState.terminated) {
+    if (_isSessionEnded()) {
+      _replyRequestTerminated(request);
       throw Exceptions.InvalidStateError('terminated');
     }
     try {
       await _connection!.setRemoteDescription(offer);
     } catch (error) {
-      request.reply(488);
+      if (_isSessionEnded()) {
+        _replyRequestTerminated(request);
+        throw Exceptions.InvalidStateError('terminated');
+      }
+      request.replySafe(488);
       logger.e(
           'emit "peerconnection:setremotedescriptionfailed" [error:${error.toString()}]');
 
@@ -2210,7 +2284,8 @@ class RTCSession extends EventManager implements Owner {
           'peerconnection.setRemoteDescription() failed');
     }
 
-    if (_state == RtcSessionState.terminated) {
+    if (_isSessionEnded()) {
+      _replyRequestTerminated(request);
       throw Exceptions.InvalidStateError('terminated');
     }
 
@@ -2224,7 +2299,8 @@ class RTCSession extends EventManager implements Owner {
 
     // Create local description.
 
-    if (_state == RtcSessionState.terminated) {
+    if (_isSessionEnded()) {
+      _replyRequestTerminated(request);
       throw Exceptions.InvalidStateError('terminated');
     }
 
@@ -2232,7 +2308,11 @@ class RTCSession extends EventManager implements Owner {
       return await _createLocalDescription(
           SdpType.answer, _rtcAnswerConstraints);
     } catch (_) {
-      request.reply(500);
+      if (_isSessionEnded()) {
+        _replyRequestTerminated(request);
+      } else {
+        request.replySafe(500);
+      }
       throw Exceptions.TypeError('_createLocalDescription() failed');
     }
   }
@@ -2736,9 +2816,10 @@ class RTCSession extends EventManager implements Owner {
       sendRequest(SipMethod.ACK);
 
       // If it is a 2XX retransmission exit now.
-      if (succeeded != null) {
+      if (succeeded) {
         return;
       }
+      succeeded = true;
 
       // Handle Session Timers.
       _handleSessionTimersInIncomingResponse(response);
@@ -2784,7 +2865,6 @@ class RTCSession extends EventManager implements Owner {
       EventManager handlers = EventManager();
       handlers.on(EventOnSuccessResponse(), (EventOnSuccessResponse event) {
         onSucceeded(event.response as IncomingResponse?);
-        succeeded = true;
       });
       handlers.on(EventOnErrorResponse(), (EventOnErrorResponse event) {
         onFailed(event.response);
@@ -2902,6 +2982,7 @@ class RTCSession extends EventManager implements Owner {
       if (succeeded) {
         return;
       }
+      succeeded = true;
 
       // Handle Session Timers.
       _handleSessionTimersInIncomingResponse(response);
@@ -2946,7 +3027,6 @@ class RTCSession extends EventManager implements Owner {
       EventManager handlers = EventManager();
       handlers.on(EventOnSuccessResponse(), (EventOnSuccessResponse event) {
         onSucceeded(event.response as IncomingResponse?);
-        succeeded = true;
       });
       handlers.on(EventOnErrorResponse(), (EventOnErrorResponse event) {
         onFailed(event.response);
@@ -3011,9 +3091,10 @@ class RTCSession extends EventManager implements Owner {
       _handleSessionTimersInIncomingResponse(response);
 
       // If it is a 2XX retransmission exit now.
-      if (succeeded != null) {
+      if (succeeded) {
         return;
       }
+      succeeded = true;
 
       // Must have SDP answer.
       if (sdpOffer) {
@@ -3064,7 +3145,6 @@ class RTCSession extends EventManager implements Owner {
         EventManager handlers = EventManager();
         handlers.on(EventOnSuccessResponse(), (EventOnSuccessResponse event) {
           onSucceeded(event.response as IncomingResponse?);
-          succeeded = true;
         });
         handlers.on(EventOnErrorResponse(), (EventOnErrorResponse event) {
           onFailed(event.response);
