@@ -131,6 +131,13 @@ class RTCSession extends EventManager implements Owner {
   /// `false` when the call ends.
   bool suppressIceTermination = false;
 
+  /// Delay before a passive ICE-restart re-INVITE is attempted after the
+  /// peer connection reports `Disconnected`. The app (vi-phone) lowers this
+  /// to 2s when app mobility is active, so recovery kicks in faster than
+  /// the default when its own recovery loop misses the flap.
+  /// Default: 20s (upstream behavior).
+  static Duration iceDisconnectRestartDelay = const Duration(seconds: 20);
+
   // SIP Timers.
   final SIPTimers _timers = SIPTimers();
 
@@ -1745,7 +1752,7 @@ class RTCSession extends EventManager implements Owner {
         logger.w('ICE Connection State Disconnected.');
         if (_iceDisconnectTimer == null && !_isAttemptingIceRestart) {
           logger.i('Starting ICE disconnect timer...');
-          _iceDisconnectTimer = Timer(const Duration(seconds: 20), () {
+          _iceDisconnectTimer = Timer(iceDisconnectRestartDelay, () {
             logger.w('ICE disconnect timer fired!');
             if (_connection?.iceConnectionState ==
                     RTCIceConnectionState.RTCIceConnectionStateDisconnected &&
