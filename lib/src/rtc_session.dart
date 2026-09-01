@@ -123,6 +123,14 @@ class RTCSession extends EventManager implements Owner {
   Timer? _iceDisconnectTimer;
   bool _isAttemptingIceRestart = false;
 
+  /// When `true`, transport- and ICE-induced failures (socket drop,
+  /// ICE failed/closed) do **not** terminate the session. Used by the app
+  /// for network handover (Wi-Fi ↔ cellular): the call survives the
+  /// transport disruption and is recovered via an ICE-restart re-INVITE
+  /// once the WebSocket reconnects. Managed externally; always reset to
+  /// `false` when the call ends.
+  bool suppressIceTermination = false;
+
   // SIP Timers.
   final SIPTimers _timers = SIPTimers();
 
@@ -1498,6 +1506,11 @@ class RTCSession extends EventManager implements Owner {
    */
   void onTransportError() {
     logger.e('onTransportError()');
+    if (suppressIceTermination) {
+      logger.w(
+          'onTransportError() | termination suppressed (network handover)');
+      return;
+    }
     if (_state != RtcSessionState.terminated) {
       terminate(<String, dynamic>{
         'status_code': 500,
@@ -1505,6 +1518,17 @@ class RTCSession extends EventManager implements Owner {
         'cause': DartSIP_C.CausesType.CONNECTION_ERROR
       });
     }
+  }
+
+  /// Resets the internal ICE-restart state machine after an app-driven
+  /// mobility renegotiation. Clears the restart-in-progress flag and any
+  /// pending disconnect watchdog so the next network flap is detected and
+  /// handled from a clean state.
+  void resetIceRestartState() {
+    logger.d('resetIceRestartState()');
+    _isAttemptingIceRestart = false;
+    _iceDisconnectTimer?.cancel();
+    _iceDisconnectTimer = null;
   }
 
   void onRequestTimeout() {
@@ -1705,6 +1729,11 @@ class RTCSession extends EventManager implements Owner {
 
       if (state == RTCIceConnectionState.RTCIceConnectionStateFailed) {
         logger.e('ICE Connection State Failed.');
+        if (suppressIceTermination) {
+          logger.w(
+              'ICE Failed termination suppressed (network handover)');
+          return;
+        }
         _iceDisconnectTimer?.cancel();
         terminate(<String, dynamic>{
           'cause': DartSIP_C.CausesType.RTP_TIMEOUT,
@@ -1754,6 +1783,11 @@ class RTCSession extends EventManager implements Owner {
         // Ensure *SIP* session state reflects closure if not already set by terminate()
         if (_state != RtcSessionState.terminated &&
             _state != RtcSessionState.canceled) {
+          if (suppressIceTermination) {
+            logger.w(
+                'ICE closed termination suppressed (network handover)');
+            return;
+          }
           logger.w(
               'ICE closed but SIP session state was not terminal. Terminating SIP session now.');
           terminate(<String, dynamic>{
