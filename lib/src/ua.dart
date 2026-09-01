@@ -20,7 +20,6 @@ import 'rtc_session.dart';
 import 'sanity_check.dart';
 import 'sip_message.dart';
 import 'socket_transport.dart';
-import 'publish.dart';
 import 'subscriber.dart';
 import 'timers.dart';
 import 'transactions/invite_client.dart';
