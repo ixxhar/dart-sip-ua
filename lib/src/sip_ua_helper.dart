@@ -3,11 +3,12 @@ import 'dart:async';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:logger/logger.dart';
 import 'package:sdp_transform/sdp_transform.dart' as sdp_transform;
-
 import 'package:sip_ua/src/uri.dart';
+
 import 'config.dart';
 import 'constants.dart' as DartSIP_C;
 import 'enums.dart';
+import 'event_manager/attended_transfer_events.dart';
 import 'event_manager/event_manager.dart';
 import 'event_manager/internal_events.dart';
 import 'event_manager/subscriber_events.dart';
@@ -15,6 +16,7 @@ import 'logger.dart';
 import 'map_helper.dart';
 import 'message.dart';
 import 'options.dart';
+import 'replaces.dart';
 import 'publish.dart';
 import 'rtc_session.dart';
 import 'rtc_session/refer_subscriber.dart';
@@ -74,6 +76,9 @@ class SIPUAHelper extends EventManager {
 
     return false;
   }
+
+  /// Contact URI generated for the User-Agent.
+  String? get contactUri => _ua?.contact?.uri?.toString();
 
   RegistrationState get registerState => _registerState;
 
@@ -365,6 +370,10 @@ class SIPUAHelper extends EventManager {
       });
     });
 
+    handlers.on(EventNewInfo(), (EventNewInfo event) {
+      _notifyInfoListeners(event);
+    });
+
     handlers.on(EventReInvite(), (EventReInvite event) {
       logger.d('Reinvite received in helper, notifying listeners');
       _notifyReInviteListeners(event);
@@ -563,6 +572,24 @@ class SIPUAHelper extends EventManager {
       listener.onNewNotify(Notify(request: event.request));
     }
   }
+
+  void _notifyInfoListeners(EventNewInfo event) {
+    // Copy to prevent concurrent modification exception
+    List<SipUaHelperListener> listeners = _sipUaHelperListeners.toList();
+    final IncomingRequest? request = event.request is IncomingRequest
+        ? event.request as IncomingRequest
+        : null;
+    final SipInfo info = SipInfo(
+      contentType:
+          event.info?.contentType ?? request?.getHeader('content-type'),
+      body: event.info?.body ?? request?.body,
+      request: request,
+      originator: event.originator,
+    );
+    for (SipUaHelperListener listener in listeners) {
+      listener.onNewInfo(info);
+    }
+  }
 }
 
 enum CallStateEnum {
@@ -626,6 +653,249 @@ class Call {
     _session.refer(target, <String, dynamic>{
       'replaces': replaces,
     });
+  }
+
+  // ============================================================================
+  // Attended Transfer (Consultative Transfer) - RFC 5589
+  // ============================================================================
+
+  /// Gets the From tag from the SIP dialog.
+  ///
+  /// The From tag uniquely identifies this end of the SIP dialog.
+  /// Returns `null` if the session is not established.
+  String? get fromTag => _session.from_tag;
+
+  /// Gets the To tag from the SIP dialog.
+  ///
+  /// The To tag uniquely identifies the remote end of the SIP dialog.
+  /// Returns `null` if the session is not established.
+  String? get toTag => _session.to_tag;
+
+  /// Gets the raw Call-ID without the appended from_tag.
+  ///
+  /// The sip_ua library internally appends `from_tag` to `call_id` for uniqueness.
+  /// This getter strips that suffix to get the original Call-ID header value,
+  /// which is required for constructing a valid Replaces header.
+  String? get rawCallId {
+    final String? fullId = _id;
+    final String? tag = fromTag;
+    if (fullId != null && tag != null && fullId.endsWith(tag)) {
+      return fullId.substring(0, fullId.length - tag.length);
+    }
+    return fullId;
+  }
+
+  /// Returns complete dialog information for this call.
+  ///
+  /// This includes all three components needed to uniquely identify
+  /// a SIP dialog: Call-ID, From tag, and To tag.
+  ///
+  /// Useful for debugging or manual transfer construction.
+  Map<String, String?> getDialogInfo() {
+    return <String, String?>{
+      'callId': rawCallId,
+      'fromTag': fromTag,
+      'toTag': toTag,
+    };
+  }
+
+  /// Performs an attended transfer (consultative transfer) to the remote party
+  /// of another active call.
+  ///
+  /// In an attended transfer, you first establish a consultation call with the
+  /// transfer target, then transfer your original call to them. This allows you
+  /// to announce the transfer before completing it.
+  ///
+  /// **Flow:**
+  /// 1. You are on a call with Party B (this call)
+  /// 2. You place Party B on hold and call Party C (consultation call)
+  /// 3. You call `attendedTransfer(consultationCall)` on this call
+  /// 4. A REFER is sent to Party B with the Replaces header
+  /// 5. Party B sends INVITE with Replaces to Party C
+  /// 6. Party B and Party C are now connected
+  ///
+  /// **Parameters:**
+  /// - [callToTransferTo]: The consultation call whose remote party will
+  ///   receive the transferred call.
+  /// - [onTrying]: Optional callback when transfer starts (100 Trying).
+  /// - [onProgress]: Optional callback when transfer is progressing.
+  /// - [onAccepted]: Optional callback when transfer succeeds. The original
+  ///   call will be automatically terminated.
+  /// - [onFailed]: Optional callback when transfer fails.
+  ///
+  /// **Returns:**
+  /// - `ReferSubscriber` if the transfer was initiated successfully.
+  /// - `null` if the transfer could not be initiated (e.g., missing dialog tags).
+  ///
+  /// **Example:**
+  /// ```dart
+  /// // originalCall is your active call with Bob
+  /// // consultationCall is your call with Charlie
+  ///
+  /// originalCall.attendedTransfer(
+  ///   consultationCall,
+  ///   onAccepted: () {
+  ///     print('Bob and Charlie are now connected!');
+  ///   },
+  ///   onFailed: () {
+  ///     print('Transfer failed, resuming call with Bob');
+  ///     originalCall.unhold();
+  ///   },
+  /// );
+  /// ```
+  ReferSubscriber? attendedTransfer(
+    Call callToTransferTo, {
+    void Function()? onTrying,
+    void Function(String? statusLine)? onProgress,
+    void Function()? onAccepted,
+    void Function(String? statusLine)? onFailed,
+  }) {
+    assert(
+        _session != null, 'ERROR(attendedTransfer): rtc session is invalid!');
+
+    // Place this call on hold before transferring
+    _session.hold();
+
+    // Extract the raw Call-ID from the consultation call
+    String callId = callToTransferTo.id ?? '';
+    final String? consultationFromTag = callToTransferTo.fromTag;
+    if (consultationFromTag != null && callId.endsWith(consultationFromTag)) {
+      callId = callId.substring(0, callId.length - consultationFromTag.length);
+    }
+
+    // Validate that we have the required dialog tags
+    if (callToTransferTo.fromTag == null || callToTransferTo.toTag == null) {
+      logger.e('attendedTransfer: Missing dialog tags on consultation call');
+      return null;
+    }
+
+    // Build the Replaces object with the consultation call's dialog info
+    final Replaces replaces = Replaces(
+      callId: callId,
+      fromTag: callToTransferTo.fromTag!,
+      toTag: callToTransferTo.toTag!,
+    );
+
+    logger.d(
+        'attendedTransfer: Initiating transfer to ${callToTransferTo.remote_identity}');
+    logger.d('attendedTransfer: Replaces=$replaces');
+
+    // Send REFER with Replaces header to the remote party
+    final ReferSubscriber? referSubscriber = _session.refer(
+      callToTransferTo.remote_identity,
+      <String, dynamic>{'replaces': replaces},
+    );
+
+    if (referSubscriber == null) {
+      logger.e('attendedTransfer: Failed to create ReferSubscriber');
+      return null;
+    }
+
+    // Set up event handlers for transfer progress
+    referSubscriber.on(EventReferTrying(), (EventReferTrying data) {
+      logger.d('attendedTransfer: Trying');
+      onTrying?.call();
+    });
+
+    referSubscriber.on(EventReferProgress(), (EventReferProgress data) {
+      logger.d('attendedTransfer: Progress - ${data.status_line}');
+      onProgress?.call(data.status_line);
+    });
+
+    referSubscriber.on(EventReferAccepted(), (EventReferAccepted data) {
+      logger.d('attendedTransfer: Accepted - ${data.status_line}');
+      onAccepted?.call();
+      // Terminate this call as the transfer is complete
+      _session.terminate();
+    });
+
+    referSubscriber.on(EventReferFailed(), (EventReferFailed data) {
+      logger.d('attendedTransfer: Failed - ${data.status_line}');
+      onFailed?.call(data.status_line);
+    });
+
+    return referSubscriber;
+  }
+
+  /// Performs an attended transfer using explicit dialog parameters.
+  ///
+  /// This is an alternative to [attendedTransfer] when you need to specify
+  /// the transfer target and dialog parameters manually, rather than using
+  /// another Call object.
+  ///
+  /// **Parameters:**
+  /// - [targetUri]: The SIP URI of the transfer target (e.g., 'sip:charlie@example.com').
+  /// - [replaceCallId]: The Call-ID of the dialog to be replaced.
+  /// - [replaceFromTag]: The From tag of the dialog to be replaced.
+  /// - [replaceToTag]: The To tag of the dialog to be replaced.
+  /// - [onTrying]: Optional callback when transfer starts.
+  /// - [onProgress]: Optional callback when transfer is progressing.
+  /// - [onAccepted]: Optional callback when transfer succeeds.
+  /// - [onFailed]: Optional callback when transfer fails.
+  ///
+  /// **Returns:**
+  /// - `ReferSubscriber` if the transfer was initiated successfully.
+  /// - `null` if the transfer could not be initiated.
+  ReferSubscriber? attendedTransferWithParams({
+    required String targetUri,
+    required String replaceCallId,
+    required String replaceFromTag,
+    required String replaceToTag,
+    void Function()? onTrying,
+    void Function(String? statusLine)? onProgress,
+    void Function()? onAccepted,
+    void Function(String? statusLine)? onFailed,
+  }) {
+    assert(_session != null,
+        'ERROR(attendedTransferWithParams): rtc session is invalid!');
+
+    // Place this call on hold before transferring
+    _session.hold();
+
+    // Build the Replaces object
+    final Replaces replaces = Replaces(
+      callId: replaceCallId,
+      fromTag: replaceFromTag,
+      toTag: replaceToTag,
+    );
+
+    logger.d('attendedTransferWithParams: Initiating transfer to $targetUri');
+    logger.d('attendedTransferWithParams: Replaces=$replaces');
+
+    // Send REFER with Replaces header
+    final ReferSubscriber? referSubscriber = _session.refer(
+      targetUri,
+      <String, dynamic>{'replaces': replaces},
+    );
+
+    if (referSubscriber == null) {
+      logger.e('attendedTransferWithParams: Failed to create ReferSubscriber');
+      return null;
+    }
+
+    // Set up event handlers
+    referSubscriber.on(EventReferTrying(), (EventReferTrying data) {
+      logger.d('attendedTransferWithParams: Trying');
+      onTrying?.call();
+    });
+
+    referSubscriber.on(EventReferProgress(), (EventReferProgress data) {
+      logger.d('attendedTransferWithParams: Progress - ${data.status_line}');
+      onProgress?.call(data.status_line);
+    });
+
+    referSubscriber.on(EventReferAccepted(), (EventReferAccepted data) {
+      logger.d('attendedTransferWithParams: Accepted - ${data.status_line}');
+      onAccepted?.call();
+      _session.terminate();
+    });
+
+    referSubscriber.on(EventReferFailed(), (EventReferFailed data) {
+      logger.d('attendedTransferWithParams: Failed - ${data.status_line}');
+      onFailed?.call(data.status_line);
+    });
+
+    return referSubscriber;
   }
 
   void hangup([Map<String, dynamic>? options]) {
@@ -834,11 +1104,20 @@ abstract class SipUaHelperListener {
   void onNewMessage(SIPMessageRequest msg);
   void onNewNotify(Notify ntf);
   void onNewReinvite(ReInvite event);
+  void onNewInfo(SipInfo info) {}
 }
 
 class Notify {
   Notify({this.request});
   IncomingRequest? request;
+}
+
+class SipInfo {
+  SipInfo({this.contentType, this.body, this.request, this.originator});
+  String? contentType;
+  String? body;
+  IncomingRequest? request;
+  Originator? originator;
 }
 
 class ReInvite {

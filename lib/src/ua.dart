@@ -14,6 +14,7 @@ import 'logger.dart';
 import 'message.dart';
 import 'options.dart';
 import 'parser.dart' as Parser;
+import 'publish.dart';
 import 'registrator.dart';
 import 'rtc_session.dart';
 import 'sanity_check.dart';

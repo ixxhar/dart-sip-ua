@@ -9,7 +9,7 @@ import 'package:flutter/foundation.dart' show kIsWeb;
 class RegisterWidget extends StatefulWidget {
   final SIPUAHelper? _helper;
 
-  RegisterWidget(this._helper, {Key? key}) : super(key: key);
+  RegisterWidget(this._helper, {super.key});
 
   @override
   State<RegisterWidget> createState() => _MyRegisterWidget();
@@ -126,8 +126,8 @@ class _MyRegisterWidget extends State<RegisterWidget>
 
     _saveSettings();
 
-       currentUser.register(SipUser(
-        wsUrl: _wsUriController.text,  
+    currentUser.register(SipUser(
+        wsUrl: _wsUriController.text,
         //this is the websocket url which was missing in the original code hence it
         //was showing null in the register method of sip_user_cubit.dart and always
         //redirected to 'wss://tryit.jssip.net:10443', present inside sip_ua_helper.dart
@@ -332,5 +332,10 @@ class _MyRegisterWidget extends State<RegisterWidget>
   @override
   void onNewReinvite(ReInvite event) {
     // TODO: implement onNewReinvite
+  }
+
+  @override
+  void onNewInfo(SipInfo info) {
+    // TODO: implement onNewInfo
   }
 }
