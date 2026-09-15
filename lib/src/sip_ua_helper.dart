@@ -21,6 +21,7 @@ import 'replaces.dart';
 import 'rtc_session.dart';
 import 'rtc_session/refer_subscriber.dart';
 import 'sip_message.dart';
+import 'socket_transport.dart';
 import 'stack_trace_nj.dart';
 import 'subscriber.dart';
 import 'transport_type.dart';
@@ -94,6 +95,32 @@ class SIPUAHelper extends EventManager {
     assert(_ua != null,
         'register called but not started, you must call start first.');
     _ua!.register();
+  }
+
+  /// Cycle the WebSocket transport without stopping the UA.
+  ///
+  /// Closes the underlying socket rather than the [SocketTransport] so the drop
+  /// is seen as unexpected: the transport then schedules its own recovery
+  /// attempt, and the UA re-registers automatically once the socket is back.
+  ///
+  /// Calling [SocketTransport.disconnect] instead would set its internal
+  /// close-requested flag and suppress that recovery, leaving the UA down until
+  /// [start] is called again.
+  void forceTransportReconnect() {
+    final UA? ua = _ua;
+    if (ua == null) {
+      logger.w('ERROR: forceTransportReconnect called but not started, '
+          'call start first.');
+      return;
+    }
+    final SocketTransport? transport = ua.socketTransport;
+    if (transport == null) {
+      logger.w('ERROR: forceTransportReconnect called but there is no socket '
+          'transport to cycle.');
+      return;
+    }
+    logger.d('forceTransportReconnect() : cycling socket ${transport.url}');
+    transport.socket.disconnect();
   }
 
   Future<bool> unregister([bool all = true]) async {
